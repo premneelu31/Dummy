@@ -1,0 +1,12 @@
+---
+- name: Dummy deploy playbook (for local pipeline testing only)
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Fake validate step
+      ansible.builtin.debug:
+        msg: "Validating dummy config..."
+
+    - name: Fake apply step
+      ansible.builtin.debug:
+        msg: "Applying dummy Splunk config..."

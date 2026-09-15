@@ -1,0 +1,3 @@
+---
+splunk_environment: test
+cluster_manager_server: dummy-cm-server.local

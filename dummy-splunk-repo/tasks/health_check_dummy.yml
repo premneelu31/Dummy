@@ -1,0 +1,4 @@
+---
+- name: Dummy health check task
+  ansible.builtin.debug:
+    msg: "Health check placeholder - pre/post deployment"

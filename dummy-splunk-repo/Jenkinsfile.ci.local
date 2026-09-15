@@ -1,0 +1,243 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+
+        SONARQUBE_ENV      = 'REPLACE_WITH_SONARQUBE_SERVER_NAME_IN_JENKINS'
+        NEXUS_BASE_URL     = 'https://REPLACE_WITH_NEXUS_HOST'
+        NEXUS_REPO         = 'REPLACE_WITH_NEXUS_RAW_REPO_NAME'
+        NEXUS_CRED_ID      = 'REPLACE_WITH_JENKINS_NEXUS_CRED_ID'
+
+        // ===== Naming =====
+        COMPONENT          = 'indexer_cluster'
+        FEATURE_REGEX      = 'feature.*'   // change to 'feature/.*' if you use feature/xyz
+
+        SONAR_PROJECT_KEY  = 'DCSplunk_indexer_cluster'
+        SONAR_PROJECT_NAME = 'indexer_cluster'
+    }
+
+    stages {
+
+        stage('Gate (PR + feature only)') {
+            when {
+                anyOf {
+                    changeRequest()
+                    expression { env.BRANCH_NAME ==~ /feature.*/ }
+                }
+            }
+            steps {
+                echo "CI run => BRANCH=${env.BRANCH_NAME}, PR=${env.CHANGE_ID ?: 'n/a'}"
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git --no-pager log -1 --oneline'
+            }
+        }
+
+        stage('Build (package manager-apps)') {
+            steps {
+                sh '''
+                set -e
+                mkdir -p dist reports
+
+                test -d manager-apps || { echo "manager-apps/ not found"; exit 1; }
+
+                SHA=$(git rev-parse --short=7 HEAD)
+                VERSION="${BRANCH_NAME}_${BUILD_NUMBER}_${SHA}"
+                ARTEFACT="${COMPONENT}_${VERSION}.tar.gz"
+
+                # Package ONLY what CD needs (payload)
+                tar -czf "dist/${ARTEFACT}" manager-apps
+
+                sha256sum "dist/${ARTEFACT}" > "dist/${ARTEFACT}.sha256"
+
+                cat > "dist/build.json" <<EOF
+                {
+                  "component": "${COMPONENT}",
+                  "version": "${VERSION}",
+                  "branch": "${BRANCH_NAME}",
+                  "build_number": "${BUILD_NUMBER}",
+                  "commit": "$(git rev-parse HEAD)",
+                  "timestamp_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+                }
+                EOF
+                '''
+                archiveArtifacts artifacts: 'dist/*', fingerprint: true
+            }
+        }
+
+        stage('Tests (config validation -> JUnit)') {
+            steps {
+                sh '''
+                set -e
+                mkdir -p reports
+
+                # "Unit tests" for config repos:
+                # - ensure Splunk app folder shape
+                # - ensure .conf files are present where expected
+                # - detect obvious secret patterns
+                # - basic stanza checks (lightweight)
+
+                python3 - <<'PY'
+import os, re, sys
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+root = Path("manager-apps")
+if not root.is_dir():
+    print("manager-apps/ missing")
+    sys.exit(1)
+
+failures = []
+
+# 1) Validate each app has default/app.conf
+apps = [p for p in root.iterdir() if p.is_dir()]
+if not apps:
+    failures.append(("repo", "No apps found under manager-apps/"))
+
+for app in apps:
+    default = app / "default"
+    if not default.is_dir():
+        failures.append((app.name, "Missing default/ directory"))
+        continue
+    if not (default / "app.conf").is_file():
+        failures.append((app.name, "Missing default/app.conf"))
+
+    # Optional: if default/indexes.conf exists, ensure it has at least one stanza header
+    idx = default / "indexes.conf"
+    if idx.is_file():
+        txt = idx.read_text(errors="ignore")
+        if not re.search(r"(?m)^\s*\[[^\]]+\]\s*$", txt):
+            failures.append((app.name, "indexes.conf has no stanzas ([name])"))
+
+    # Optional: if transforms.conf exists, ensure stanza headers exist
+    tr = default / "transforms.conf"
+    if tr.is_file():
+        txt = tr.read_text(errors="ignore")
+        if not re.search(r"(?m)^\s*\[[^\]]+\]\s*$", txt):
+            failures.append((app.name, "transforms.conf has no stanzas ([name])"))
+
+# 2) Basic secret pattern scan (lightweight; keep conservative)
+secret_patterns = [
+    (re.compile(r"BEGIN (RSA|OPENSSH) PRIVATE KEY"), "Private key material"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS Access Key pattern"),
+    (re.compile(r"(?i)password\s*="), "password= pattern (review)"),
+    (re.compile(r"(?i)token\s*="), "token= pattern (review)")
+]
+
+for p in Path(".").rglob("*"):
+    if not p.is_file():
+        continue
+    if ".git" in p.parts or "dist" in p.parts or "reports" in p.parts:
+        continue
+    # scan only smallish text files
+    try:
+        if p.stat().st_size > 2_000_000:
+            continue
+        data = p.read_text(errors="ignore")
+    except Exception:
+        continue
+    for rx, msg in secret_patterns:
+        if rx.search(data):
+            failures.append((str(p), f"Possible secret: {msg}"))
+
+# Write JUnit XML
+testsuite = ET.Element("testsuite", name="splunk-config-validation")
+for name, msg in failures:
+    tc = ET.SubElement(testsuite, "testcase", classname="validation", name=name)
+    f = ET.SubElement(tc, "failure", message=msg)
+    f.text = msg
+
+tree = ET.ElementTree(testsuite)
+Path("reports").mkdir(exist_ok=True)
+tree.write("reports/junit.xml", encoding="utf-8", xml_declaration=True)
+
+if failures:
+    print("Validation failures:")
+    for f in failures:
+        print(" -", f[0], ":", f[1])
+    sys.exit(1)
+else:
+    print("All validations passed.")
+PY
+                '''
+            }
+            post {
+                always {
+                    junit testResults: 'reports/junit.xml', allowEmptyResults: false
+                    archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
+                }
+            }
+        }
+
+        stage('SonarQube Scan') {
+            steps {
+                script {
+                    withSonarQubeEnv("${env.SONARQUBE_ENV}") {
+                        sh '''
+                        set -e
+                        command -v sonar-scanner >/dev/null 2>&1 || { echo "sonar-scanner not found on PATH"; exit 2; }
+                        SHA=$(git rev-parse --short=7 HEAD)
+
+                        sonar-scanner \
+                          -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+                          -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+                          -Dsonar.projectVersion="${BRANCH_NAME}-${BUILD_NUMBER}-${SHA}" \
+                          -Dsonar.sources="manager-apps" \
+                          -Dsonar.sourceEncoding="UTF-8"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Upload artefact to Nexus') {
+            // Recommend: upload for feature branches + main (not PR builds)
+            when {
+                anyOf {
+                    expression { env.BRANCH_NAME ==~ /feature.*/ }
+                    branch 'main'
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: "${env.NEXUS_CRED_ID}",
+                    usernameVariable: 'NEXUS_USER',
+                    passwordVariable: 'NEXUS_PASS'
+                )]) {
+                    sh '''
+                    set -e
+                    FILE=$(ls -1 dist/${COMPONENT}_*.tar.gz | head -1)
+                    SUM=$(ls -1 dist/${COMPONENT}_*.tar.gz.sha256 | head -1)
+
+                    BASENAME=$(basename "$FILE")
+                    SUMNAME=$(basename "$SUM")
+
+                    DEST_BASE="${NEXUS_BASE_URL}/repository/${NEXUS_REPO}/${COMPONENT}/${BRANCH_NAME}"
+
+                    echo "Uploading artefact to: ${DEST_BASE}/${BASENAME}"
+                    curl -f -u "$NEXUS_USER:$NEXUS_PASS" --upload-file "$FILE" "${DEST_BASE}/${BASENAME}"
+                    curl -f -u "$NEXUS_USER:$NEXUS_PASS" --upload-file "$SUM"  "${DEST_BASE}/${SUMNAME}"
+                    curl -f -u "$NEXUS_USER:$NEXUS_PASS" --upload-file dist/build.json "${DEST_BASE}/build.json"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "CI completed with result: ${currentBuild.currentResult}"
+        }
+    }
+}
